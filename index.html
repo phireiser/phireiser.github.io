@@ -6,24 +6,62 @@
     <title>Website Coming Soon</title>
     <style>
         body {
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            font-family: 'Roboto', sans-serif;
+            color: #fff;
+            background: url('https://www.example.com/your-background-image.jpg') no-repeat center center fixed;
+            background-size: cover;
             display: flex;
             justify-content: center;
             align-items: center;
-            height: 100vh;
-            margin: 0;
-            font-family: Arial, sans-serif;
-            background-color: #f0f0f0;
-            color: #333;
-        }
-        .container {
             text-align: center;
         }
+
+        .overlay {
+            background-color: rgba(0, 0, 0, 0.6);
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        .content {
+            z-index: 2;
+            position: relative;
+            padding: 20px;
+        }
+
         h1 {
-            font-size: 2em;
+            font-size: 3em;
             margin-bottom: 20px;
         }
+
         p {
-            font-size: 1.2em;
+            font-size: 1.5em;
+            margin-bottom: 40px;
+        }
+
+        .countdown {
+            font-size: 2em;
+            font-weight: bold;
+        }
+
+        @media (max-width: 600px) {
+            h1 {
+                font-size: 2em;
+            }
+
+            p {
+                font-size: 1.2em;
+            }
+
+            .countdown {
+                font-size: 1.5em;
+            }
         }
     </style>
     <script>
@@ -31,15 +69,40 @@
             const currentYear = new Date().getFullYear();
             return currentYear + 1;
         }
+
+        function calculateCountdown() {
+            const nextYear = getNextYear();
+            const targetDate = new Date(`April 1, ${nextYear} 00:00:00`).getTime();
+            const now = new Date().getTime();
+            const distance = targetDate - now;
+
+            const days = Math.floor(distance / (1000 * 60 * 60 * 24));
+            const hours = Math.floor((distance % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+            const minutes = Math.floor((distance % (1000 * 60 * 60)) / (1000 * 60));
+            const seconds = Math.floor((distance % (1000 * 60)) / 1000);
+
+            document.getElementById("countdown").innerHTML = `
+                ${days}d ${hours}h ${minutes}m ${seconds}s
+            `;
+
+            if (distance < 0) {
+                document.getElementById("countdown").innerHTML = "Website is live!";
+            }
+        }
+
+        setInterval(calculateCountdown, 1000);
     </script>
 </head>
 <body>
-    <div class="container">
+    <div class="overlay"></div>
+    <div class="content">
         <h1>Website Coming Soon</h1>
         <p>This website will be up and running by April 1st, <span id="next-year"></span>.</p>
+        <div class="countdown" id="countdown"></div>
     </div>
     <script>
         document.getElementById("next-year").textContent = getNextYear();
+        calculateCountdown();
     </script>
 </body>
 </html>
