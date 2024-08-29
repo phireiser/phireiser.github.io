@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Website Coming Soon</title>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background-color: #f0f0f0;
+            color: #333;
+        }
+        .container {
+            text-align: center;
+        }
+        h1 {
+            font-size: 2em;
+            margin-bottom: 20px;
+        }
+        p {
+            font-size: 1.2em;
+        }
+    </style>
+    <script>
+        function getNextYear() {
+            const currentYear = new Date().getFullYear();
+            return currentYear + 1;
+        }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>Website Coming Soon</h1>
+        <p>This website will be up and running by April 1st, <span id="next-year"></span>.</p>
+    </div>
+    <script>
+        document.getElementById("next-year").textContent = getNextYear();
+    </script>
+</body>
+</html>
