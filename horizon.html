@@ -1,0 +1,1123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>reiser.onl Home</title>
+<style>
+  :root{
+    --ink: #e8e3da;
+    --ink-dim: rgba(232,227,218,.45);
+  }
+  *{ box-sizing:border-box; margin:0; padding:0 }
+  html,body{ height:100%; background:#05070d; overflow:hidden }
+  body{
+    font-family: ui-sans-serif, "Söhne", "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    color: var(--ink);
+  }
+  canvas#sky{ position:fixed; inset:0; width:100%; height:100%; display:block }
+
+  .hud{
+    position:fixed; left:0; right:0; bottom:0;
+    padding: 0 clamp(16px,4vw,40px) calc(clamp(16px,3.5vh,32px) + env(safe-area-inset-bottom));
+    display:flex; justify-content:space-between; align-items:flex-end; gap:24px;
+    pointer-events:none;
+    opacity:0;
+    transition: opacity .5s ease;
+    text-shadow: 0 1px 14px rgba(0,0,0,.55);
+  }
+  .hud.on{ opacity:1 }
+
+  .mark{
+    font-size: clamp(13px,1.5vw,15px);
+    letter-spacing:.16em; text-transform:uppercase; font-weight:500;
+  }
+  .clock{
+    font-variant-numeric: tabular-nums;
+    font-size: clamp(30px,5.5vw,54px);
+    font-weight:200; letter-spacing:-.02em; line-height:1;
+    margin:.35em 0 .3em;
+  }
+  .meta{
+    font-size: clamp(11px,1.2vw,12.5px);
+    letter-spacing:.05em; color:var(--ink-dim); line-height:1.65;
+    max-width: 34ch;
+  }
+  .right{ text-align:right; font-size:clamp(10px,1.1vw,11.5px); letter-spacing:.14em;
+          text-transform:uppercase; color:var(--ink-dim); line-height:1.9 }
+  @media (max-width: 620px){ .right{ display:none } }
+
+  /* time scrubber — design tool, toggled with D */
+  .dev{
+    position:fixed; top:0; left:0; right:0; display:none;
+    padding:10px clamp(12px,3vw,24px); gap:14px; align-items:center;
+    background:rgba(6,8,14,.82); backdrop-filter:blur(14px);
+    border-bottom:1px solid rgba(232,227,218,.12);
+    font-size:12px; letter-spacing:.04em;
+  }
+  .dev.on{ display:flex }
+  .dev input[type=range]{ flex:1; accent-color:#e8e3da; min-width:80px }
+  .dev button{
+    font:inherit; color:var(--ink); background:transparent; cursor:pointer;
+    border:1px solid rgba(232,227,218,.28); border-radius:999px; padding:4px 12px;
+  }
+  .dev button:hover{ border-color:rgba(232,227,218,.6) }
+  .dev .val{ font-variant-numeric:tabular-nums; min-width:15ch; color:var(--ink-dim) }
+  :focus-visible{ outline:2px solid #e8e3da; outline-offset:3px }
+</style>
+</head>
+<body>
+
+<canvas id="sky"></canvas>
+
+<div class="dev" id="dev">
+  <button id="devNow">now</button>
+  <span>hours</span>
+  <input id="devHours" type="range" min="-8760" max="8760" step="1" value="0">
+  <span class="val" id="devVal"></span>
+  <button id="devPlay">play year</button>
+</div>
+
+<div class="hud" id="hud">
+  <div>
+    <div class="mark">Salzburg</div>
+    <div class="clock" id="clock">--:--</div>
+    <div class="meta" id="meta"></div>
+  </div>
+  <div class="right" id="right"></div>
+</div>
+
+<script>
+"use strict";
+/* =========================================================================
+   A window onto Salzburg. Sun, moon, planets and stars are at their real
+   positions for 47.8095 N, 13.0550 E. The ridgeline is invented — seeded
+   from this device plus a random salt, so every visit gets its own valley.
+   No server, no build step, no network.
+   ========================================================================= */
+
+const LAT = 47.8095, LON = 13.0550, TZ = "Europe/Vienna";
+const TAU = Math.PI * 2, RAD = Math.PI / 180, DEG = 180 / Math.PI;
+
+/* ---------- small utilities ---------- */
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp  = (a, b, t) => a + (b - a) * t;
+const smoothstep = t => (t = clamp(t, 0, 1), t * t * (3 - 2 * t));
+const wrap  = (v, m) => ((v % m) + m) % m;
+/* shortest signed angular difference, radians */
+const angDiff = (a, b) => wrap(a - b + Math.PI, TAU) - Math.PI;
+
+function mulberry32(a){
+  return function(){
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function hashStr(s){
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+
+/* ---------- colour: mixing happens in OKLab so gradients stay clean ---------- */
+function hexToLin(hex){
+  const n = parseInt(hex.slice(1), 16);
+  const f = c => { c /= 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  return [f(n >> 16 & 255), f(n >> 8 & 255), f(n & 255)];
+}
+function linToOklab(r, g, b){
+  const l = Math.cbrt(0.4122214708*r + 0.5363325363*g + 0.0514459929*b);
+  const m = Math.cbrt(0.2119034982*r + 0.6806995451*g + 0.1073969566*b);
+  const s = Math.cbrt(0.0883024619*r + 0.2817188376*g + 0.6299787005*b);
+  return [
+    0.2104542553*l + 0.7936177850*m - 0.0040720468*s,
+    1.9779984951*l - 2.4285922050*m + 0.4505937099*s,
+    0.0259040371*l + 0.7827717662*m - 0.8086757660*s
+  ];
+}
+function oklabToRgb(L, A, B){
+  const l_ = L + 0.3963377774*A + 0.2158037573*B;
+  const m_ = L - 0.1055613458*A - 0.0638541728*B;
+  const s_ = L - 0.0894841775*A - 1.2914855480*B;
+  const l = l_*l_*l_, m = m_*m_*m_, s = s_*s_*s_;
+  const lin = [
+     4.0767416621*l - 3.3077115913*m + 0.2309699292*s,
+    -1.2684380046*l + 2.6097574011*m - 0.3413193965*s,
+    -0.0041960863*l - 0.7034186147*m + 1.7076147010*s
+  ];
+  return lin.map(c => {
+    c = c <= 0.0031308 ? 12.92*c : 1.055*Math.pow(Math.max(c,0), 1/2.4) - 0.055;
+    return clamp(Math.round(c * 255), 0, 255);
+  });
+}
+const labCache = new Map();
+function lab(hex){
+  let v = labCache.get(hex);
+  if (!v){ v = linToOklab(...hexToLin(hex)); labCache.set(hex, v); }
+  return v;
+}
+function mixLab(a, b, t){ return [lerp(a[0],b[0],t), lerp(a[1],b[1],t), lerp(a[2],b[2],t)]; }
+function css(labv, alpha){
+  const [r,g,bl] = oklabToRgb(labv[0], labv[1], labv[2]);
+  return alpha === undefined ? `rgb(${r},${g},${bl})` : `rgba(${r},${g},${bl},${alpha})`;
+}
+
+/* =========================================================================
+   ASTRONOMY
+   Sun and moon follow the standard low-precision series (Meeus, as
+   popularised by SunCalc). Planets use Schlyter's low-precision elements.
+   Accurate to well under a degree — far finer than one pixel here.
+   ========================================================================= */
+const dayMs = 86400000, J1970 = 2440588, J2000 = 2451545;
+const OBL = RAD * 23.4397;
+
+const toJulian = d => d.valueOf() / dayMs - 0.5 + J1970;
+const fromJulian = j => new Date((j + 0.5 - J1970) * dayMs);
+const toDays = d => toJulian(d) - J2000;
+
+const rightAscension = (l, b) => Math.atan2(Math.sin(l)*Math.cos(OBL) - Math.tan(b)*Math.sin(OBL), Math.cos(l));
+const declination    = (l, b) => Math.asin(Math.sin(b)*Math.cos(OBL) + Math.cos(b)*Math.sin(OBL)*Math.sin(l));
+const siderealTime   = (d, lw) => RAD * (280.16 + 360.9856235 * d) - lw;
+
+const solarMeanAnomaly = d => RAD * (357.5291 + 0.98560028 * d);
+function eclipticLongitude(M){
+  const C = RAD * (1.9148*Math.sin(M) + 0.02*Math.sin(2*M) + 0.0003*Math.sin(3*M));
+  return M + C + RAD * 102.9372 + Math.PI;
+}
+function sunCoords(d){
+  const M = solarMeanAnomaly(d), L = eclipticLongitude(M);
+  return { dec: declination(L, 0), ra: rightAscension(L, 0), M, L };
+}
+function moonCoords(d){
+  const L = RAD * (218.316 + 13.176396 * d);
+  const M = RAD * (134.963 + 13.064993 * d);
+  const F = RAD * (93.272  + 13.229350 * d);
+  const l = L + RAD * 6.289 * Math.sin(M);
+  const b = RAD * 5.128 * Math.sin(F);
+  const dt = 385001 - 20905 * Math.cos(M);
+  return { ra: rightAscension(l, b), dec: declination(l, b), dist: dt };
+}
+
+/* equatorial -> horizontal for our fixed vantage point */
+const PHI = RAD * LAT, LW = RAD * -LON;
+function horizontal(ra, dec, d){
+  const H = siderealTime(d, LW) - ra;
+  const alt = Math.asin(Math.sin(PHI)*Math.sin(dec) + Math.cos(PHI)*Math.cos(dec)*Math.cos(H));
+  /* SunCalc's azimuth is measured from south, westward; +PI makes it a compass bearing */
+  const az = Math.atan2(Math.sin(H), Math.cos(H)*Math.sin(PHI) - Math.tan(dec)*Math.cos(PHI)) + Math.PI;
+  return { alt, az: wrap(az, TAU) };
+}
+
+function sunPosition(date){
+  const d = toDays(date), c = sunCoords(d);
+  return horizontal(c.ra, c.dec, d);
+}
+function moonPosition(date){
+  const d = toDays(date), c = moonCoords(d);
+  const h = horizontal(c.ra, c.dec, d);
+  /* refraction lifts a low moon slightly; only meaningful near the horizon */
+  if (h.alt * DEG > -1) {
+    h.alt += RAD * 0.017 / Math.tan(h.alt + RAD * 10.26 / (h.alt * DEG + 5.10));
+  }
+  h.dist = c.dist;
+  return h;
+}
+function moonIllumination(date){
+  const d = toDays(date), s = sunCoords(d), m = moonCoords(d), sdist = 149598000;
+  const phi = Math.acos(Math.sin(s.dec)*Math.sin(m.dec) + Math.cos(s.dec)*Math.cos(m.dec)*Math.cos(s.ra - m.ra));
+  const inc = Math.atan2(sdist * Math.sin(phi), m.dist - sdist * Math.cos(phi));
+  const angle = Math.atan2(
+    Math.cos(s.dec) * Math.sin(s.ra - m.ra),
+    Math.sin(s.dec) * Math.cos(m.dec) - Math.cos(s.dec) * Math.sin(m.dec) * Math.cos(s.ra - m.ra)
+  );
+  return {
+    fraction: (1 + Math.cos(inc)) / 2,
+    phase: 0.5 + 0.5 * inc * (angle < 0 ? -1 : 1) / Math.PI
+  };
+}
+
+/* --- sunrise / sunset --- */
+const J0 = 0.0009;
+const julianCycle   = (d, lw) => Math.round(d - J0 - lw / TAU);
+const approxTransit = (Ht, lw, n) => J0 + (Ht + lw) / TAU + n;
+const solarTransitJ = (ds, M, L) => J2000 + ds + 0.0053*Math.sin(M) - 0.0069*Math.sin(2*L);
+function hourAngle(h, phi, dec){
+  const x = (Math.sin(h) - Math.sin(phi)*Math.sin(dec)) / (Math.cos(phi)*Math.cos(dec));
+  return Math.acos(clamp(x, -1, 1));
+}
+/** returns {rise, set} as Dates, for the day containing `date` */
+function sunTimes(date, h = RAD * -0.833){
+  const d = toDays(date), n = julianCycle(d, LW);
+  const ds = approxTransit(0, LW, n);
+  const M = solarMeanAnomaly(ds), L = eclipticLongitude(M);
+  const dec = declination(L, 0);
+  const Jnoon = solarTransitJ(ds, M, L);
+  const w = hourAngle(h, PHI, dec);
+  const Jset = solarTransitJ(approxTransit(w, LW, n), M, L);
+  return { rise: fromJulian(Jnoon - (Jset - Jnoon)), set: fromJulian(Jset), noon: fromJulian(Jnoon) };
+}
+/** compass bearing of sunrise — this is the month indicator.
+    Swings ~54 deg (midsummer) to ~126 deg (midwinter) at this latitude. */
+function sunriseAzimuth(date){ return sunPosition(sunTimes(date).rise).az; }
+
+/* --- planets: Schlyter's elements, d counted from 1999 Dec 31.0 UT --- */
+const PLANETS = [
+  { name:"Venus",   mag:-4.0, tint:"#fff4dd",
+    N:[76.6799,2.46590e-5], i:[3.3946,2.75e-8], w:[54.8910,1.38374e-5],
+    a:0.723330, e:[0.006773,-1.302e-9], M:[48.0052,1.6021302244] },
+  { name:"Mars",    mag:0.7,  tint:"#ffb490",
+    N:[49.5574,2.11081e-5], i:[1.8497,-1.78e-8], w:[286.5016,2.92961e-5],
+    a:1.523688, e:[0.093405,2.516e-9], M:[18.6021,0.5240207766] },
+  { name:"Jupiter", mag:-2.2, tint:"#fff2ce",
+    N:[100.4542,2.76854e-5], i:[1.3030,-1.557e-7], w:[273.8777,1.64505e-5],
+    a:5.20256, e:[0.048498,4.469e-9], M:[19.8950,0.0830853001] },
+  { name:"Saturn",  mag:0.6,  tint:"#ffe9b8",
+    N:[113.6634,2.38980e-5], i:[2.4886,-1.081e-7], w:[339.3939,2.97661e-5],
+    a:9.55475, e:[0.055546,-9.499e-9], M:[316.9670,0.0334442282] }
+];
+function schlyterDays(date){ return date.valueOf() / dayMs - 10956; }
+function eccAnomaly(M, e){
+  let E = M + e * Math.sin(M) * (1 + e * Math.cos(M));
+  for (let k = 0; k < 4; k++){
+    E = E - (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+  }
+  return E;
+}
+function planetPosition(p, date){
+  const d = schlyterDays(date);
+  const N = RAD * wrap(p.N[0] + p.N[1]*d, 360);
+  const i = RAD * (p.i[0] + p.i[1]*d);
+  const w = RAD * wrap(p.w[0] + p.w[1]*d, 360);
+  const e = p.e[0] + p.e[1]*d;
+  const M = RAD * wrap(p.M[0] + p.M[1]*d, 360);
+  const E = eccAnomaly(M, e);
+  const xv = p.a * (Math.cos(E) - e);
+  const yv = p.a * Math.sqrt(1 - e*e) * Math.sin(E);
+  const v = Math.atan2(yv, xv), r = Math.hypot(xv, yv);
+  const u = v + w;
+  const xh = r * (Math.cos(N)*Math.cos(u) - Math.sin(N)*Math.sin(u)*Math.cos(i));
+  const yh = r * (Math.sin(N)*Math.cos(u) + Math.cos(N)*Math.sin(u)*Math.cos(i));
+  const zh = r * Math.sin(u) * Math.sin(i);
+
+  /* the Sun's geocentric rectangular position, same element set */
+  const Ms = RAD * wrap(356.0470 + 0.9856002585*d, 360);
+  const ws = RAD * (282.9404 + 4.70935e-5*d);
+  const es = 0.016709 - 1.151e-9*d;
+  const Es = eccAnomaly(Ms, es);
+  const xvs = Math.cos(Es) - es, yvs = Math.sqrt(1 - es*es) * Math.sin(Es);
+  const lonsun = Math.atan2(yvs, xvs) + ws, rs = Math.hypot(xvs, yvs);
+  const xs = rs * Math.cos(lonsun), ys = rs * Math.sin(lonsun);
+
+  const xg = xh + xs, yg = yh + ys, zg = zh;
+  /* ecliptic -> equatorial */
+  const xe = xg;
+  const ye = yg * Math.cos(OBL) - zg * Math.sin(OBL);
+  const ze = yg * Math.sin(OBL) + zg * Math.cos(OBL);
+  const ra = Math.atan2(ye, xe), dec = Math.atan2(ze, Math.hypot(xe, ye));
+  const h = horizontal(ra, dec, toDays(date));
+  h.tint = p.tint; h.mag = p.mag; h.name = p.name;
+  return h;
+}
+
+/* --- bright stars, J2000 [RA deg, Dec deg, magnitude] --- */
+const BRIGHT = [
+[101.29,-16.72,-1.46],[213.92,19.18,-0.05],[279.23,38.78,0.03],[79.17,46.00,0.08],
+[78.63,-8.20,0.13],[114.83,5.22,0.34],[88.79,7.41,0.50],[297.70,8.87,0.77],
+[68.98,16.51,0.85],[201.30,-11.16,1.04],[247.35,-26.43,1.09],[116.33,28.03,1.14],
+[344.41,-29.62,1.16],[310.36,45.28,1.25],[152.09,11.97,1.35],[104.66,-28.97,1.50],
+[113.65,31.89,1.58],[263.40,-37.10,1.62],[81.28,6.35,1.64],[81.57,28.61,1.65],
+[84.05,-1.20,1.69],[85.19,-1.94,1.77],[193.51,55.96,1.77],[165.93,61.75,1.79],
+[51.08,49.86,1.79],[107.10,-26.39,1.83],[276.04,-34.38,1.85],[206.89,49.31,1.86],
+[89.88,44.95,1.90],[99.43,16.40,1.93],[95.67,-17.96,1.98],[37.95,89.26,1.98],
+[141.90,-8.66,1.98],[31.79,23.46,2.00],[10.90,-17.99,2.04],[283.82,-26.30,2.05],
+[86.94,-9.67,2.06],[2.10,29.09,2.06],[17.43,35.62,2.06],[154.99,19.84,2.08],
+[263.73,12.56,2.08],[222.68,74.16,2.08],[30.97,42.33,2.10],[177.26,14.57,2.11],
+[47.04,40.96,2.12],[233.67,26.71,2.22],[83.00,-0.30,2.23],[200.98,54.93,2.23],
+[269.15,51.49,2.23],[305.56,40.26,2.23],[10.13,56.54,2.24],[2.29,59.15,2.28],
+[345.94,28.08,2.42],[326.05,9.88,2.39],[346.19,15.21,2.49],[319.64,62.59,2.45],
+[305.25,33.97,2.46],[14.18,60.72,2.47],[45.57,4.09,2.53],[83.18,-17.82,2.58],
+[236.07,6.43,2.63],[21.45,60.24,2.68],[296.56,10.61,2.72],[222.72,-16.04,2.75],
+[195.54,10.96,2.83],[3.31,15.18,2.83],[56.87,24.11,2.87],[194.01,38.32,2.89],
+[230.18,71.83,3.00],[84.41,21.14,3.00],[292.68,27.96,3.05],[183.86,57.03,3.31],
+[28.60,63.67,3.35],[211.10,64.38,3.65],[178.46,53.69,2.44],[165.46,56.38,2.37],
+[221.25,27.07,2.35]
+];
+
+/* Galactic north pole (J2000) — used to find the plane of the Milky Way,
+   and the galactic centre, which is where the band is brightest. */
+const GNP = { ra: 192.8595 * RAD, dec: 27.1284 * RAD };
+const GC  = { ra: 266.4050 * RAD, dec: -28.9362 * RAD };
+const angSep = (ra1, d1, ra2, d2) =>
+  Math.acos(clamp(Math.sin(d1)*Math.sin(d2) + Math.cos(d1)*Math.cos(d2)*Math.cos(ra1-ra2), -1, 1));
+
+/* =========================================================================
+   PERFORMANCE TIERS
+   ========================================================================= */
+const TIERS = [
+  { name:"low",    dpr:1,   stars:260,  fill:120,  milky:false, meteors:false, twinkle:false,
+    cloudRes:128, cloudOct:3, cloudDiv:8, cloudFps:1.5, fps:6,  glow:2 },
+  { name:"medium", dpr:1.5, stars:700,  fill:420,  milky:true,  meteors:true,  twinkle:false,
+    cloudRes:256, cloudOct:4, cloudDiv:5, cloudFps:4,   fps:24, glow:3 },
+  { name:"high",   dpr:2,   stars:1500, fill:1000, milky:true,  meteors:true,  twinkle:true,
+    cloudRes:256, cloudOct:5, cloudDiv:4, cloudFps:6,   fps:30, glow:4 }
+];
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
+
+function detectTier(){
+  if (reduceMotion.matches) return 0;
+  const cores = navigator.hardwareConcurrency || 4;
+  const mem   = navigator.deviceMemory || 4;
+  const dpr   = window.devicePixelRatio || 1;
+  const px    = innerWidth * innerHeight * dpr * dpr;
+  let score = 0;
+  score += cores >= 8 ? 2 : cores >= 4 ? 1 : 0;
+  score += mem   >= 8 ? 2 : mem   >= 4 ? 1 : 0;
+  if (px > 4.5e6) score -= 1;
+  if (px > 8e6)   score -= 1;
+  return score >= 3 ? 2 : score >= 1 ? 1 : 0;
+}
+let tierIndex = detectTier();
+let T = TIERS[tierIndex];
+
+/* =========================================================================
+   SKY PALETTE
+   Keyed on the sun's true altitude rather than the clock, so the seasons
+   fall out for free: a January noon never reaches the blue of a June one.
+   ========================================================================= */
+const SKY = [
+  { alt:  70, zen:"#173f8c", mid:"#417ec8", hor:"#a6c6e6" },
+  { alt:  40, zen:"#1d4b98", mid:"#5089cf", hor:"#b4cfe9" },
+  { alt:  18, zen:"#2b5ea6", mid:"#6e9ad2", hor:"#cfdae2" },
+  { alt:   8, zen:"#3a6cab", mid:"#87a8ca", hor:"#e2d5c1" },
+  { alt:   3, zen:"#3f6699", mid:"#9d94ac", hor:"#f2bd86" },
+  { alt:   0, zen:"#37527f", mid:"#8d7196", hor:"#f4964f" },
+  { alt:  -3, zen:"#2b4173", mid:"#7d5583", hor:"#e8703f" },
+  { alt:  -6, zen:"#1d2f5c", mid:"#553c62", hor:"#c04a35" },
+  { alt:  -9, zen:"#14204a", mid:"#33294f", hor:"#71303f" },
+  { alt: -12, zen:"#0d1636", mid:"#1d1c39", hor:"#3a2030" },
+  { alt: -15, zen:"#080f26", mid:"#10122a", hor:"#1d1422" },
+  { alt: -18, zen:"#04081a", mid:"#070b1e", hor:"#0c101d" },
+  { alt: -90, zen:"#03060f", mid:"#050813", hor:"#080b16" }
+];
+function skyPalette(sunAltDeg){
+  let i = 0;
+  while (i < SKY.length - 2 && SKY[i + 1].alt > sunAltDeg) i++;
+  const a = SKY[i], b = SKY[i + 1];
+  const t = smoothstep((a.alt - sunAltDeg) / (a.alt - b.alt));
+  return {
+    zen: mixLab(lab(a.zen), lab(b.zen), t),
+    mid: mixLab(lab(a.mid), lab(b.mid), t),
+    hor: mixLab(lab(a.hor), lab(b.hor), t)
+  };
+}
+/* 0 = full daylight, 1 = fully dark */
+const darkness = sunAltDeg => smoothstep((-4 - sunAltDeg) / 12);
+
+/* =========================================================================
+   TERRAIN
+   Ridge height as a sum of integer-frequency ridged sines, so it wraps
+   seamlessly around all 360 degrees. Amplitude is biased toward the south,
+   where the Alps actually are.
+   ========================================================================= */
+function makeRidge(rng, harmonics, sharpness){
+  const terms = [];
+  for (let k = 0; k < harmonics; k++){
+    const n = 1 + k + Math.floor(rng() * 2);
+    terms.push({ n, a: 1 / Math.pow(n, 1.02), p: rng() * TAU });
+  }
+  const total = terms.reduce((s, t) => s + t.a, 0);
+  return az => {
+    let s = 0;
+    for (const t of terms) s += t.a * (1 - Math.abs(Math.sin(t.n * az + t.p)));
+    return Math.pow(s / total, sharpness);
+  };
+}
+function makeLayers(seed){
+  const rng = mulberry32(seed);
+  const specs = [
+    { maxAlt: 13.0, base: 0.6, harm: 11, sharp: 1.5, haze: 0.62, snow: true },
+    { maxAlt:  8.0, base: 0.4, harm:  9, sharp: 1.7, haze: 0.34, snow: true },
+    { maxAlt:  4.4, base: 0.3, harm:  7, sharp: 2.0, haze: 0.10, snow: false }
+  ];
+  return specs.map(s => {
+    const f = makeRidge(rng, s.harm, s.sharp);
+    /* one sample per half-degree of bearing */
+    const N = 720, h = new Float32Array(N), raw = new Float32Array(N);
+    let mn = Infinity, mx = -Infinity;
+    for (let i = 0; i < N; i++){
+      raw[i] = f((i / N) * TAU);
+      if (raw[i] < mn) mn = raw[i];
+      if (raw[i] > mx) mx = raw[i];
+    }
+    /* the raw sum only ever occupies part of its range, so stretch it —
+       otherwise a 13-degree layer peaks at three */
+    const span = (mx - mn) || 1;
+    for (let i = 0; i < N; i++){
+      const az = (i / N) * TAU;
+      /* the Alps sit south of the city, so raise the southern half */
+      const southBias = 0.42 + 0.58 * smoothstep((Math.cos(az - Math.PI) + 0.4) / 1.4);
+      h[i] = s.base + ((raw[i] - mn) / span) * s.maxAlt * southBias;
+    }
+    return { ...s, h, N };
+  });
+}
+function ridgeAt(layer, az){
+  const x = wrap(az / TAU, 1) * layer.N;
+  const i = Math.floor(x), t = x - i;
+  return lerp(layer.h[i % layer.N], layer.h[(i + 1) % layer.N], t);
+}
+/* snow line as a fraction of each layer's maximum, driven by the month */
+function snowFraction(date){
+  const doy = (date - new Date(date.getUTCFullYear(), 0, 0)) / dayMs;
+  /* lowest around late February, highest in early August */
+  const s = Math.cos((doy - 50) / 365 * TAU);
+  return lerp(0.90, 0.28, (s + 1) / 2);
+}
+
+/* =========================================================================
+   SETUP
+   ========================================================================= */
+const canvas = document.getElementById("sky");
+const ctx = canvas.getContext("2d", { alpha: false });
+let W = 0, H = 0, dpr = 1;
+let horizonY = 0, pxPerDeg = 10, camAz = Math.PI, camTarget = Math.PI;
+
+/* device fingerprint + a salt that changes each visit */
+const SALT = Math.floor(Math.random() * 1e9);
+const SEED = hashStr([screen.width, screen.height, devicePixelRatio,
+                      navigator.hardwareConcurrency || 0, SALT].join("|"));
+let layers = makeLayers(SEED);
+
+let stars = [], fillStars = [], milky = [], meteors = [];
+function buildStars(){
+  const rng = mulberry32(SEED ^ 0x9e3779b9);
+  stars = BRIGHT.slice(0, Math.min(BRIGHT.length, T.stars)).map(([ra, dec, mag]) => ({
+    ra: ra * RAD, dec: dec * RAD, mag, ph: rng() * TAU
+  }));
+  /* procedural faint field, so the sky doesn't look like a constellation chart */
+  fillStars = [];
+  for (let i = 0; i < T.fill; i++){
+    const ra = rng() * TAU;
+    const dec = Math.asin(rng() * 2 - 1);
+    fillStars.push({ ra, dec, mag: 3.8 + rng() * 2.4, ph: rng() * TAU });
+  }
+  /* the Milky Way: points near the great circle 90 deg from the galactic pole,
+     weighted brighter toward the galactic centre in Sagittarius */
+  milky = [];
+  if (T.milky){
+    let guard = 0;
+    while (milky.length < 900 && guard++ < 40000){
+      const ra = rng() * TAU, dec = Math.asin(rng() * 2 - 1);
+      const sep = angSep(ra, dec, GNP.ra, GNP.dec) * DEG;
+      const off = Math.abs(sep - 90);
+      if (off > 13) continue;
+      const near = 1 - smoothstep(angSep(ra, dec, GC.ra, GC.dec) * DEG / 110);
+      const w = (1 - off / 13) * (0.28 + 0.72 * near);
+      if (rng() > w) continue;
+      milky.push({ ra, dec, w });
+    }
+  }
+}
+
+/* ---------- cloud deck ----------
+   A flat layer of cloud at unit height, projected properly: for each pixel
+   we work out where the line of sight pierces the deck, and sample noise at
+   that ground position. Perspective, convergence and drift all fall out of
+   the geometry instead of being faked with stacked strips. Computed at
+   reduced resolution and upscaled, because clouds are soft anyway.        */
+let noiseGrid = null, noiseN = 0;
+
+function buildClouds(){
+  const N = T.cloudRes;
+  noiseN = N;
+  noiseGrid = new Float32Array(N * N);
+  const rng = mulberry32(SEED ^ 0x51ed270b);
+
+  /* tileable value-noise octaves, summed once and baked in, so the
+     per-pixel cost later is a single bilinear lookup */
+  const grids = [];
+  for (let o = 0; o < T.cloudOct; o++){
+    const n = 4 << o, g = new Float32Array(n * n);
+    for (let i = 0; i < g.length; i++) g[i] = rng();
+    grids.push({ n, g });
+  }
+  const sample = (g, n, x, y) => {
+    const fx = x * n, fy = y * n;
+    const x0 = Math.floor(fx), y0 = Math.floor(fy);
+    const tx = smoothstep(fx - x0), ty = smoothstep(fy - y0);
+    const at = (a, b) => g[wrap(b, n) * n + wrap(a, n)];
+    return lerp(lerp(at(x0,y0), at(x0+1,y0), tx), lerp(at(x0,y0+1), at(x0+1,y0+1), tx), ty);
+  };
+  for (let y = 0; y < N; y++){
+    for (let x = 0; x < N; x++){
+      let v = 0, amp = 1, tot = 0;
+      for (let o = 0; o < grids.length; o++){
+        v += amp * sample(grids[o].g, grids[o].n, x / N, y / N);
+        tot += amp; amp *= 0.52;
+      }
+      noiseGrid[y * N + x] = v / tot;
+    }
+  }
+}
+/* bilinear, wrapping */
+function noiseAt(u, v){
+  const N = noiseN;
+  const fu = u - Math.floor(u / N) * N, fv = v - Math.floor(v / N) * N;
+  const x0 = fu | 0, y0 = fv | 0;
+  const x1 = x0 + 1 === N ? 0 : x0 + 1, y1 = y0 + 1 === N ? 0 : y0 + 1;
+  const tx = fu - x0, ty = fv - y0;
+  const a = noiseGrid[y0 * N + x0], b = noiseGrid[y0 * N + x1];
+  const c = noiseGrid[y1 * N + x0], d = noiseGrid[y1 * N + x1];
+  return lerp(lerp(a, b, tx), lerp(c, d, tx), ty);
+}
+
+let cloudLayer = null, cloudLayerCtx = null, cloudImg = null;
+let cloudBandTop = 0, cloudDiv = 4, cloudW = 0, cloudH = 0, lastCloudUpdate = -1e9;
+const CLOUD_TOP = 34;   /* degrees; deck fades out above this */
+const CLOUD_LOW = 0.45; /* degrees; below this it is lost in haze */
+
+function makeCloudLayer(){
+  cloudDiv = T.cloudDiv;
+  cloudBandTop = Math.max(0, Math.floor(horizonY - CLOUD_TOP * pxPerDeg));
+  const bandH = Math.max(4, Math.ceil(horizonY - cloudBandTop));
+  cloudW = Math.max(2, Math.ceil(W / cloudDiv));
+  cloudH = Math.max(2, Math.ceil(bandH / cloudDiv));
+  cloudLayer = document.createElement("canvas");
+  cloudLayer.width = cloudW; cloudLayer.height = cloudH;
+  cloudLayerCtx = cloudLayer.getContext("2d");
+  cloudImg = cloudLayerCtx.createImageData(cloudW, cloudH);
+  lastCloudUpdate = -1e9;
+}
+
+/* month drives how much sky the deck covers */
+function cloudCoverage(date){
+  const m = date.getUTCMonth();
+  return [0.52,0.52,0.48,0.45,0.43,0.42,0.42,0.43,0.46,0.5,0.54,0.54][m];
+}
+
+function updateCloudPixels(date, sunAltDeg, sunAz, now){
+  const data = cloudImg.data;
+  const dark = darkness(sunAltDeg);
+  const low = smoothstep((9 - sunAltDeg) / 13);
+  const cov = cloudCoverage(date);
+  const t = now / 1000;
+
+  /* colours: tops catch the sky, undersides catch a low sun */
+  const topC = oklabToRgb(...mixLab(lab("#eef1f6"), lab("#252c42"), dark * 0.9));
+  const botC = oklabToRgb(...mixLab(lab("#b9c0cf"), lab("#161b2a"), dark * 0.92));
+  const warmC = oklabToRgb(...mixLab(lab("#ffb066"), lab("#ff6f36"), 0.4));
+  const warmAmt = low * (1 - dark) * 0.85;
+
+  /* deck sits at unit height; 6 world units per noise tile */
+  const K = noiseN / 6;
+  const windU = t * 0.9, windV = t * 0.35;
+
+  /* per-column bearing, and how close it is to the sun */
+  const colWarm = new Float32Array(cloudW);
+  for (let px = 0; px < cloudW; px++){
+    const sx = (px + 0.5) * cloudDiv;
+    const az = camAz + ((sx - W / 2) / pxPerDeg) * RAD;
+    const dA = Math.abs(angDiff(az, sunAz));
+    colWarm[px] = Math.exp(-Math.pow(dA / 0.85, 2)) * warmAmt;
+  }
+
+  let i = 0;
+  for (let py = 0; py < cloudH; py++){
+    const sy = cloudBandTop + (py + 0.5) * cloudDiv;
+    const altDeg = (horizonY - sy) / pxPerDeg;
+
+    if (altDeg <= CLOUD_LOW || altDeg > CLOUD_TOP){
+      for (let px = 0; px < cloudW; px++){ data[i+3] = 0; i += 4; }
+      continue;
+    }
+    /* where this line of sight meets the deck; capped, because right at the
+       horizon the distance runs away and the noise would alias into speckle */
+    const dist = Math.min(1 / Math.tan(altDeg * RAD), 34);
+    /* thins out at the very top and dissolves into haze at the bottom */
+    const fade = smoothstep((altDeg - CLOUD_LOW) / 4.5) *
+                 (1 - smoothstep((altDeg - CLOUD_TOP * 0.6) / (CLOUD_TOP * 0.42)));
+    /* the deck is seen edge-on near the horizon, so it reads as denser */
+    const thick = clamp(0.55 + dist * 0.055, 0.55, 1.35);
+    const mixT = smoothstep(altDeg / 20);
+    const r0 = lerp(botC[0], topC[0], mixT);
+    const g0 = lerp(botC[1], topC[1], mixT);
+    const b0 = lerp(botC[2], topC[2], mixT);
+    const underside = 1 - mixT;
+
+    for (let px = 0; px < cloudW; px++){
+      const sx = (px + 0.5) * cloudDiv;
+      const az = camAz + ((sx - W / 2) / pxPerDeg) * RAD;
+      const u = (dist * Math.sin(az)) * K + windU;
+      const v = (dist * Math.cos(az)) * K + windV;
+      let a = (noiseAt(u, v) - cov) / (1 - cov);
+      if (a <= 0){ data[i+3] = 0; i += 4; continue; }
+      a = Math.pow(a, 1.35) * thick * fade;
+      if (a <= 0.004){ data[i+3] = 0; i += 4; continue; }
+
+      const w = colWarm[px] * underside;
+      data[i]   = r0 + (warmC[0] - r0) * w;
+      data[i+1] = g0 + (warmC[1] - g0) * w;
+      data[i+2] = b0 + (warmC[2] - b0) * w;
+      data[i+3] = Math.min(255, a * 255);
+      i += 4;
+    }
+  }
+  cloudLayerCtx.putImageData(cloudImg, 0, 0);
+}
+
+function drawClouds(pal, sunAltDeg, sunAz, now){
+  if (!cloudLayerCtx || !noiseGrid) return;
+  const dark = darkness(sunAltDeg);
+  if (dark > 0.93) return;
+  /* the deck changes slowly, so it is recomputed well below frame rate */
+  if (now - lastCloudUpdate > 1000 / T.cloudFps){
+    updateCloudPixels(currentDate(), sunAltDeg, sunAz, now);
+    lastCloudUpdate = now;
+  }
+  ctx.save();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.globalAlpha = 0.9 * (1 - dark * 0.6);
+  ctx.drawImage(cloudLayer, 0, 0, cloudW, cloudH,
+                0, cloudBandTop, W, horizonY - cloudBandTop);
+  ctx.restore();
+}
+
+/* --- projection: simple cylindrical panorama --- */
+function resize(){
+  dpr = Math.min(window.devicePixelRatio || 1, T.dpr);
+  W = Math.round(innerWidth * dpr);
+  H = Math.round(innerHeight * dpr);
+  canvas.width = W; canvas.height = H;
+
+  /* composition sits high: roughly four fifths sky */
+  const horizonFrac = innerHeight / innerWidth > 1.4 ? 0.82 : 0.78;
+  horizonY = H * horizonFrac;
+
+  /* fit ~72 degrees of sky above the horizon, then keep the resulting
+     horizontal field of view inside something photographic */
+  pxPerDeg = horizonY / 72;
+  let hFov = W / pxPerDeg;
+  if (hFov > 165) pxPerDeg = W / 165;
+  if (hFov < 42)  pxPerDeg = W / 42;
+
+  buildClouds();
+  makeCloudLayer();
+}
+const projX = az => W / 2 + angDiff(az, camAz) * DEG * pxPerDeg;
+const projY = alt => horizonY - alt * DEG * pxPerDeg;
+
+/* =========================================================================
+   DRAWING
+   ========================================================================= */
+function drawSky(pal, sunX, sunAltDeg, dark){
+  const g = ctx.createLinearGradient(0, 0, 0, horizonY);
+  g.addColorStop(0, css(pal.zen));
+  g.addColorStop(0.55, css(pal.mid));
+  g.addColorStop(1, css(pal.hor));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, horizonY + 2);
+
+  /* the sky is warmer and brighter in the sun's compass direction —
+     this is most of what makes a rendered sky read as real */
+  const warmth = Math.exp(-Math.pow((sunAltDeg + 2) / 13, 2));
+  if (warmth > 0.01){
+    const r = Math.max(W, horizonY) * 1.15;
+    const rg = ctx.createRadialGradient(sunX, horizonY, 0, sunX, horizonY, r);
+    const warm = mixLab(lab("#ff9b45"), lab("#ffd9a0"), 0.25);
+    rg.addColorStop(0, css(warm, 0.62 * warmth));
+    rg.addColorStop(0.35, css(warm, 0.22 * warmth));
+    rg.addColorStop(1, css(warm, 0));
+    ctx.globalCompositeOperation = "lighter";
+    ctx.fillStyle = rg;
+    ctx.fillRect(0, 0, W, horizonY + 2);
+    ctx.globalCompositeOperation = "source-over";
+  }
+
+  /* Earth's shadow and the Belt of Venus, opposite the sun at twilight */
+  const belt = Math.exp(-Math.pow((sunAltDeg + 3.5) / 4.5, 2));
+  if (belt > 0.02 && T.milky){
+    const antiX = projX(wrap(camAzSunAz + Math.PI, TAU));
+    const yTop = projY(11 * RAD), yBot = projY(0);
+    const bg = ctx.createLinearGradient(0, yTop, 0, yBot);
+    bg.addColorStop(0, css(lab("#e8a0a6"), 0));
+    bg.addColorStop(0.45, css(lab("#e8a0a6"), 0.30 * belt));
+    bg.addColorStop(0.72, css(lab("#3a4470"), 0.34 * belt));
+    bg.addColorStop(1, css(lab("#28304f"), 0.30 * belt));
+    ctx.save();
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, yTop, W, yBot - yTop);
+    ctx.restore();
+  }
+}
+let camAzSunAz = Math.PI; /* remembered for the belt-of-Venus placement */
+
+function drawStars(d, dark, now){
+  if (dark < 0.02) return;
+  ctx.globalCompositeOperation = "lighter";
+
+  if (T.milky){
+    for (const s of milky){
+      const h = horizontal(s.ra, s.dec, d);
+      if (h.alt <= 0) continue;
+      const y = projY(h.alt), x = projX(h.az);
+      if (x < -20 || x > W + 20) continue;
+      const a = dark * s.w * 0.26 * smoothstep(h.alt * DEG / 8);
+      ctx.fillStyle = `rgba(214,222,255,${a})`;
+      ctx.fillRect(x, y, 1.6 * dpr, 1.6 * dpr);
+    }
+  }
+  const t = now / 1000;
+  const draw = (list, boost) => {
+    for (const s of list){
+      const h = horizontal(s.ra, s.dec, d);
+      if (h.alt <= 0) continue;
+      const x = projX(h.az);
+      if (x < -20 || x > W + 20) continue;
+      const y = projY(h.alt);
+      /* stars near the horizon dim through more atmosphere */
+      const ext = smoothstep(h.alt * DEG / 9);
+      let a = clamp((5.6 - s.mag) / 5.2, 0, 1) * dark * ext * boost;
+      if (T.twinkle) a *= 0.82 + 0.18 * Math.sin(t * 2.4 + s.ph);
+      if (a < 0.012) continue;
+      const r = (0.5 + Math.max(0, 2.3 - s.mag) * 0.42) * dpr;
+      ctx.fillStyle = `rgba(240,244,255,${a})`;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+      if (s.mag < 1.4){
+        ctx.fillStyle = `rgba(200,215,255,${a * 0.16})`;
+        ctx.beginPath(); ctx.arc(x, y, r * 4.5, 0, TAU); ctx.fill();
+      }
+    }
+  };
+  draw(stars, 1);
+  draw(fillStars, 0.75);
+  ctx.globalCompositeOperation = "source-over";
+}
+
+function drawPlanets(date, dark){
+  if (dark < 0.05) return;
+  ctx.globalCompositeOperation = "lighter";
+  for (const p of PLANETS){
+    const h = planetPosition(p, date);
+    if (h.alt <= 0) continue;
+    const x = projX(h.az);
+    if (x < -20 || x > W + 20) continue;
+    const y = projY(h.alt);
+    const a = clamp((3.2 - h.mag) / 5, 0, 1) * dark * smoothstep(h.alt * DEG / 6);
+    const r = (1.0 + Math.max(0, 1.6 - h.mag) * 0.7) * dpr;
+    ctx.fillStyle = css(lab(h.tint), a);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.fill();
+    ctx.fillStyle = css(lab(h.tint), a * 0.13);
+    ctx.beginPath(); ctx.arc(x, y, r * 6, 0, TAU); ctx.fill();
+  }
+  ctx.globalCompositeOperation = "source-over";
+}
+
+function drawMoon(date, moon, sunScreen, dark){
+  if (moon.alt < -0.06) return;
+  const x = projX(moon.az), y = projY(moon.alt);
+  if (x < -120 || x > W + 120) return;
+
+  /* the true disc is half a degree wide — a few pixels. Drawn at three
+     times that so the phase is legible, which is the one deliberate lie here. */
+  const r = Math.max(7 * dpr, 0.52 * pxPerDeg * 1.5);
+  const ill = moonIllumination(date);
+  const k = 2 * ill.fraction - 1;
+  const vis = dark * 0.75 + 0.25;
+
+  ctx.globalCompositeOperation = "lighter";
+  const halo = ctx.createRadialGradient(x, y, r * 0.9, x, y, r * (T.glow >= 3 ? 12 : 6));
+  halo.addColorStop(0, `rgba(214,224,255,${0.20 * vis * ill.fraction})`);
+  halo.addColorStop(1, "rgba(214,224,255,0)");
+  ctx.fillStyle = halo;
+  ctx.beginPath(); ctx.arc(x, y, r * (T.glow >= 3 ? 12 : 6), 0, TAU); ctx.fill();
+  ctx.globalCompositeOperation = "source-over";
+
+  ctx.save();
+  ctx.translate(x, y);
+  /* the lit limb points at the sun */
+  ctx.rotate(Math.atan2(sunScreen.y - y, sunScreen.x - x));
+
+  /* earthshine: the unlit disc is never quite invisible */
+  ctx.fillStyle = `rgba(150,162,196,${0.14 * dark})`;
+  ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fill();
+
+  ctx.fillStyle = `rgba(248,246,238,${0.88 * vis + 0.12})`;
+  ctx.beginPath();
+  ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2, false);
+  ctx.ellipse(0, 0, r * Math.abs(k), r, 0, Math.PI / 2, -Math.PI / 2, k >= 0);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawSun(sun, sunX, dark){
+  const y = projY(sun.alt);
+  const altDeg = sun.alt * DEG;
+  if (altDeg < -9) return;
+  const r = Math.max(5 * dpr, 0.53 * pxPerDeg * 1.5);
+  const low = smoothstep((6 - altDeg) / 8);           /* 1 near the horizon */
+  ctx.globalCompositeOperation = "lighter";
+  const rings = T.glow;
+  for (let i = rings; i >= 1; i--){
+    const rr = r * (2 + i * i * 3.2);
+    const g = ctx.createRadialGradient(sunX, y, 0, sunX, y, rr);
+    const c = mixLab(lab("#fff3d2"), lab("#ff8a3c"), low * 0.75);
+    g.addColorStop(0, css(c, 0.30 / i));
+    g.addColorStop(1, css(c, 0));
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(sunX, y, rr, 0, TAU); ctx.fill();
+  }
+  if (altDeg > -1.2){
+    ctx.fillStyle = css(mixLab(lab("#fffdf4"), lab("#ffb257"), low), 0.95);
+    ctx.beginPath(); ctx.arc(sunX, y, r, 0, TAU); ctx.fill();
+  }
+  ctx.globalCompositeOperation = "source-over";
+}
+
+function drawTerrain(pal, date, dark, sunX){
+  const snowF = snowFraction(date);
+  const step = Math.max(1, Math.round(2 * dpr));
+
+  for (let li = 0; li < layers.length; li++){
+    const L = layers[li];
+    const rock = mixLab(lab("#12161c"), lab("#0a0c12"), 0.3);
+    /* aerial perspective pulls distant ridges toward the colour of the sky
+       behind them, which is what makes them go pink at sunset */
+    const col = mixLab(rock, pal.hor, L.haze * (1 - dark * 0.55));
+    const dim = mixLab(col, lab("#05070d"), dark * 0.78);
+
+    ctx.beginPath();
+    ctx.moveTo(-2, H + 2);
+    for (let x = -2; x <= W + step; x += step){
+      const az = camAz + ((x - W / 2) / pxPerDeg) * RAD;
+      ctx.lineTo(x, projY(ridgeAt(L, az) * RAD));
+    }
+    ctx.lineTo(W + 2, H + 2);
+    ctx.closePath();
+
+    ctx.save();
+    ctx.clip();
+    ctx.fillStyle = css(dim);
+    ctx.fillRect(0, 0, W, H);
+
+    if (L.snow){
+      const snowAlt = L.base + (L.maxAlt - L.base) * snowF;
+      const ys = projY(snowAlt * RAD);
+      const g = ctx.createLinearGradient(0, ys - L.maxAlt * pxPerDeg * 0.5, 0, ys + 26 * dpr);
+      const snowCol = mixLab(lab("#f2f4f8"), pal.hor, 0.42 + dark * 0.3);
+      g.addColorStop(0, css(mixLab(snowCol, lab("#05070d"), dark * 0.7), 0.92));
+      g.addColorStop(1, css(mixLab(snowCol, lab("#05070d"), dark * 0.7), 0));
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, W, ys + 26 * dpr);
+    }
+    ctx.restore();
+  }
+}
+
+/* the sunrise bearing, marked on the horizon, with the two solstice limits */
+function drawYearMark(riseAz, dark){
+  /* the two extremes the sunrise bearing ever reaches from this latitude */
+  const june = Math.acos(clamp(Math.sin( 23.44 * RAD) / Math.cos(PHI), -1, 1));
+  const dec  = Math.acos(clamp(Math.sin(-23.44 * RAD) / Math.cos(PHI), -1, 1));
+  const marks = [
+    { az: june,        a: 0.16, h: 7 },   /* midsummer sunrise, NE */
+    { az: dec,         a: 0.16, h: 7 },   /* midwinter sunrise, SE */
+    { az: Math.PI / 2, a: 0.10, h: 5 },   /* due east, the equinoxes */
+    { az: riseAz,      a: 0.55, h: 13 }   /* today */
+  ];
+  ctx.save();
+  for (const m of marks){
+    const x = projX(m.az);
+    if (x < -30 || x > W + 30) continue;
+    const y0 = horizonY, y1 = horizonY - m.h * dpr * 2.2;
+    const g = ctx.createLinearGradient(0, y0, 0, y1);
+    const c = mixLab(lab("#ffd9a8"), lab("#ffffff"), 0.2);
+    g.addColorStop(0, css(c, m.a * (0.35 + 0.65 * dark)));
+    g.addColorStop(1, css(c, 0));
+    ctx.fillStyle = g;
+    ctx.fillRect(x - 0.8 * dpr, y1, 1.6 * dpr, y0 - y1);
+  }
+  ctx.restore();
+}
+
+function drawMeteors(dark, now, dt){
+  if (!T.meteors || dark < 0.6) return;
+  if (Math.random() < dt / 9000) {
+    meteors.push({
+      x: Math.random() * W, y: Math.random() * horizonY * 0.55,
+      vx: (Math.random() > 0.5 ? 1 : -1) * (0.35 + Math.random() * 0.5) * W / 1400,
+      vy: (0.25 + Math.random() * 0.4) * W / 1400, life: 0,
+      len: (60 + Math.random() * 120) * dpr
+    });
+  }
+  ctx.globalCompositeOperation = "lighter";
+  for (let i = meteors.length - 1; i >= 0; i--){
+    const m = meteors[i];
+    m.life += dt / 900;
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    if (m.life > 1 || m.y > horizonY){ meteors.splice(i, 1); continue; }
+    const a = Math.sin(m.life * Math.PI) * 0.8 * dark;
+    const nx = m.vx / Math.hypot(m.vx, m.vy), ny = m.vy / Math.hypot(m.vx, m.vy);
+    const g = ctx.createLinearGradient(m.x, m.y, m.x - nx * m.len, m.y - ny * m.len);
+    g.addColorStop(0, `rgba(255,252,240,${a})`);
+    g.addColorStop(1, "rgba(255,252,240,0)");
+    ctx.strokeStyle = g; ctx.lineWidth = 1.5 * dpr; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(m.x, m.y); ctx.lineTo(m.x - nx * m.len, m.y - ny * m.len); ctx.stroke();
+  }
+  ctx.globalCompositeOperation = "source-over";
+}
+
+function drawVignette(dark){
+  const g = ctx.createRadialGradient(W / 2, horizonY * 0.62, Math.min(W, H) * 0.28,
+                                     W / 2, horizonY * 0.62, Math.max(W, H) * 0.82);
+  g.addColorStop(0, "rgba(0,0,0,0)");
+  g.addColorStop(1, `rgba(0,0,0,${0.30 + dark * 0.18})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+/* =========================================================================
+   HUD
+   ========================================================================= */
+const PHASES = ["new moon","waxing crescent","first quarter","waxing gibbous",
+                "full moon","waning gibbous","last quarter","waning crescent"];
+const COMPASS = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"];
+const bearingName = az => COMPASS[Math.round(wrap(az, TAU) / TAU * 16) % 16];
+
+const fmtTime = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", minute: "2-digit", hour12: false });
+const fmtDate = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, day: "numeric", month: "long" });
+const fmtFull = new Intl.DateTimeFormat("en-GB", { timeZone: TZ, dateStyle: "medium", timeStyle: "short" });
+
+const el = { clock: document.getElementById("clock"), meta: document.getElementById("meta"),
+             right: document.getElementById("right"), hud: document.getElementById("hud") };
+let hudTick = 0;
+function updateHud(date, sun, moon, riseAz){
+  const times = sunTimes(date);
+  const ill = moonIllumination(date);
+  const phaseName = PHASES[Math.round(ill.phase * 8) % 8];
+  el.clock.textContent = fmtTime.format(date);
+  el.meta.innerHTML =
+    `${fmtDate.format(date)} &middot; sun ${sun.alt > 0 ? "up" : "down"} ` +
+    `${(sun.alt * DEG).toFixed(0)}&deg;<br>` +
+    `sunrise ${fmtTime.format(times.rise)} at ${bearingName(riseAz)} ` +
+    `&middot; sunset ${fmtTime.format(times.set)}<br>` +
+    `${phaseName}, ${Math.round(ill.fraction * 100)}% lit`;
+  el.right.innerHTML =
+    `47.81&deg;N 13.06&deg;E<br>looking ${bearingName(camAz)}<br>${T.name} detail`;
+}
+
+/* =========================================================================
+   LOOP
+   ========================================================================= */
+let offsetMs = 0, playing = false, lastFrame = 0, frameAcc = [], lastHud = 0, debug = false;
+function currentDate(){ return new Date(Date.now() + offsetMs); }
+
+function render(now, dt){
+  const date = currentDate();
+  const d = toDays(date);
+  const sun = sunPosition(date);
+  const moon = moonPosition(date);
+  const riseAz = sunriseAzimuth(date);
+  const sunAltDeg = sun.alt * DEG;
+  const dark = darkness(sunAltDeg);
+
+  /* the camera faces whatever is worth looking at: the sun by day, the moon
+     by night, and otherwise the point where the sun will next come up */
+  if (sunAltDeg > -7) camTarget = sun.az;
+  else if (moon.alt > 0.02) camTarget = moon.az;
+  else camTarget = riseAz;
+  camAz = wrap(camAz + angDiff(camTarget, camAz) * Math.min(1, dt / 2600), TAU);
+  camAzSunAz = sun.az;
+
+  const pal = skyPalette(sunAltDeg);
+  const sunX = projX(sun.az);
+
+  ctx.fillStyle = "#05070d";
+  ctx.fillRect(0, 0, W, H);
+  drawSky(pal, sunX, sunAltDeg, dark);
+  drawStars(d, dark, now);
+  drawPlanets(date, dark);
+  drawMeteors(dark, now, dt);
+  drawMoon(date, moon, { x: sunX, y: projY(sun.alt) }, dark);
+  drawSun(sun, sunX, dark);
+  drawClouds(pal, sunAltDeg, sun.az, now);
+  drawYearMark(riseAz, dark);
+  drawTerrain(pal, date, dark, sunX);
+  drawVignette(dark);
+
+  if (debug && now - lastHud > 900){ updateHud(date, sun, moon, riseAz); lastHud = now; }
+}
+
+function loop(now){
+  requestAnimationFrame(loop);
+  const dt = Math.min(now - lastFrame, 200);
+  const interval = 1000 / T.fps;
+  if (now - lastFrame < interval) return;
+  lastFrame = now;
+  if (playing) offsetMs += dt * 3600 * 24;
+
+  const t0 = performance.now();
+  render(now, dt);
+  /* if this device can't keep up, quietly drop a tier */
+  frameAcc.push(performance.now() - t0);
+  if (frameAcc.length > 45){
+    const avg = frameAcc.reduce((a, b) => a + b, 0) / frameAcc.length;
+    frameAcc.length = 0;
+    if (avg > 26 && tierIndex > 0){
+      tierIndex--; T = TIERS[tierIndex];
+      buildStars(); resize();
+    }
+  }
+}
+
+/* =========================================================================
+   BOOT
+   ========================================================================= */
+let resizeTimer = null;
+addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(resize, 180);
+});
+reduceMotion.addEventListener?.("change", () => {
+  tierIndex = detectTier(); T = TIERS[tierIndex]; buildStars(); resize();
+});
+
+/* time scrubber — for designing, not for visitors */
+const dev = document.getElementById("dev");
+const devHours = document.getElementById("devHours");
+const devVal = document.getElementById("devVal");
+addEventListener("keydown", e => {
+  if (e.key !== "d" && e.key !== "D") return;
+  debug = !debug;
+  dev.classList.toggle("on", debug);
+  el.hud.classList.toggle("on", debug);
+  if (debug){
+    lastHud = 0;
+    devVal.textContent = fmtFull.format(currentDate());
+  }
+});
+devHours.addEventListener("input", () => {
+  playing = false;
+  offsetMs = Number(devHours.value) * 3600000;
+  devVal.textContent = fmtFull.format(currentDate());
+});
+document.getElementById("devNow").addEventListener("click", () => {
+  playing = false; offsetMs = 0; devHours.value = 0;
+  devVal.textContent = fmtFull.format(currentDate());
+});
+document.getElementById("devPlay").addEventListener("click", e => {
+  playing = !playing;
+  e.target.textContent = playing ? "pause" : "play year";
+});
+
+buildStars();
+resize();
+lastFrame = performance.now();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
